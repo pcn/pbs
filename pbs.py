@@ -150,14 +150,14 @@ class Command(object):
     @property
     def stdout(self):
         if self.call_args["bg"]: self.wait()
-        if self.call_args["generateor"]:
+        if self.call_args["generator"]:
             raise TypeError("generator requested, can't use stdout'")
         return self._stdout
 
     @property
     def stderr(self):
         if self.call_args["bg"]: self.wait()
-        if self.call_args["generateor"]:
+        if self.call_args["generator"]:
             raise TypeError("generator requested, can't use stderr'")
         return self._stderr
 

@@ -141,7 +141,7 @@ class Command(object):
             "out": None, # redirect STDOUT
             "err": None, # redirect STDERR
             "err_to_out": None, # redirect STDERR to STDOUT
-            "generate": None, # use stdout and stderr as generators
+            "generator": None, # use stdout and stderr as generators
         }
         
     def __getattr__(self, p):
@@ -150,14 +150,14 @@ class Command(object):
     @property
     def stdout(self):
         if self.call_args["bg"]: self.wait()
-        if self.call_args["generate"]:
+        if self.call_args["generateor"]:
             raise TypeError("generator requested, can't use stdout'")
         return self._stdout
 
     @property
     def stderr(self):
         if self.call_args["bg"]: self.wait()
-        if self.call_args["generate"]:
+        if self.call_args["generateor"]:
             raise TypeError("generator requested, can't use stderr'")
         return self._stderr
 
@@ -482,7 +482,7 @@ class Command(object):
         # evaluate
         if self.call_args["bg"]: return self
 
-        if self.call_args["generate"]:
+        if self.call_args["generator"]:
             # The caller wants a stream of input, so must call self.wait() explicitly
             # after StopIteration is raised on the fd's that want it.
             return self

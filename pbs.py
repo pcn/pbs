@@ -31,13 +31,15 @@ import re
 from glob import glob
 import shlex
 import warnings
+import select
+import traceback
 
 
 
-__version__ = "0.75"
-__project_url__ = "https://github.com/amoffat/pbs"
-
+VERSION = "0.71"
+PROJECT_URL = "https://github.com/amoffat/pbs"
 IS_PY3 = sys.version_info[0] == 3
+
 if IS_PY3: raw_input = input
 
 
@@ -130,6 +132,8 @@ class Command(object):
         self.process = None
         self._stdout = None
         self._stderr = None
+        self._stdout_buffer = list()
+        self._stderr_buffer = list()
         
         self.call_args = {
             "bg": False, # run command in background
@@ -137,6 +141,7 @@ class Command(object):
             "out": None, # redirect STDOUT
             "err": None, # redirect STDERR
             "err_to_out": None, # redirect STDERR to STDOUT
+            "generate": None, # use stdout and stderr as generators
         }
         
     def __getattr__(self, p):
@@ -145,12 +150,189 @@ class Command(object):
     @property
     def stdout(self):
         if self.call_args["bg"]: self.wait()
+        if self.call_args["generate"]:
+            raise TypeError("generator requested, can't use stdout'")
         return self._stdout
-    
+        
     @property
     def stderr(self):
         if self.call_args["bg"]: self.wait()
         return self._stderr
+
+
+    def generate_stdout(self, bufsize=1024, sep='\n'):
+        for line in self._generate_stdfds_line(bufsize, sep, STDOUT=True):
+            yield line
+        
+    def _generate_stdfds_line(self, bufsize, sep, STDOUT=False, STDERR=False):
+        """There are whole families of commands that generate data,
+        e.g. vmstat, tcpdump etc. It's silly how difficult it is to
+        use these with python's subprocess module, so deal with them
+        by selecting on file descriptors
+
+        split_char is the character that the stream will be split on.
+
+        """
+        gen = self._generate_read_fds()
+        source_done = False
+        while True:
+            # Check to see if the generator is done, and stop using it
+            # if it is.  Continuing to blindly try it can lead to
+            # StopIteration maybe getting propogated?  Anyway, this
+            # works.
+            if source_done is False:
+                try:
+                    (so,se) = gen.next()
+                    if so:
+                        self._stdout_buffer.append(so)
+                    if se:
+                        self._stderr_buffer.append(se)
+                except StopIteration:
+                    source_done = True
+
+            if STDOUT and STDERR:
+                yield (self._extract_line(self._stdout_buffer, bufsize, sep),
+                       self._extract_line(self._stderr_buffer, bufsize, sep))
+            elif STDOUT:
+                # print "called {0}".format(inspect.getframeinfo(inspect.currentframe())[2])
+                val = self._extract_line(self._stdout_buffer, bufsize, sep)
+                if len(val) > 0:
+                    yield val
+                if not self._stdout_buffer and not so:
+                    return
+            elif STDERR:
+                val = self._extract_line(self._stderr_buffer, bufsize, sep)
+                if len(val) > 0:
+                    yield val
+
+
+    def _extract_line(self, fd_buffer, bufsize, sep):
+        """Manages the fd_buffer, returning either:
+
+        1) a line of data (if sep is encountered), including
+           sep at the end
+        2) a buffer of bufsize or less (less if the fd was closed, and
+           less data was read but no sep was encountered)
+        """
+        b = fd_buffer
+        sl = len(sep)
+        line = None
+
+        def trim_car(offset):
+            retstr = b[0][0:offset+sl]
+            b[0]   = b[0][offset+sl:] # shrink the string in the car
+            # If the car is an empty string, get rid of it
+            if len(b[0]) == 0:
+                del(b[0])
+            return retstr
+
+        # null case
+        if len(b) == 0: return ""
+        if b[0] is None: return ""
+            
+        # first case, separator string is in the first string in the buffer
+        next_sep = b[0].find(sep)
+        if next_sep > -1:
+            line = trim_car(next_sep)
+        else:
+            # second case, no separator found in the first string.  Search for it
+            # in subsequent strings.  Maybe could encompass the first case
+            holding_pen = list()
+            for hold in b:
+                if hold.find(sep) > -1: 
+                    break
+                else:
+                    holding_pen.append(hold)
+            else:
+                # OH NO document what we want to do here better.  Could be deadlock-inducing?
+                sys.stderr.write("Returning {0} items without having found the separator".format(bufsize))
+                line = "".join(b)
+                del(b[:])
+                # need to fix to clarify whether we're talking bytes or characters
+                if len(line) > bufsize:
+                    b.append(line[bufsize:])
+                    line = line[0:bufsize]
+                return line
+            # Now holding_pen has strings leading up to the string with the separator.
+            if len(holding_pen) > 0: 
+                del(fd_buffer[0:len(holding_pen)])
+            tail = trim_car(hold.find(sep))
+            holding_pen.append(tail)
+            line = "".join(holding_pen)
+        return line
+    
+
+    # XXX: input?
+    def _generate_read_fds(self):
+        """Can't have reading on e.g. stdout stuck because it's
+        waiting for stderr to be read from.  So read from stdout and
+        stderr at the same time, and buffer to their respective buffers.
+
+        Using the code from subproceses.py's posix _communicate.
+
+        Maybe change this to allow an input generator, but here there
+        be dragons.  The current use case is to have a process that
+        creates output, but doesn't require input from us.  Having
+        input into the same process creates a big opportunity for
+        deadlock, I think.
+
+        THIS CANNOT BE USED WITH THE communicate() METHOD!
+
+        bufsize imposes a max # of (bytes in python 3?  Have to check
+        that out..) that will be read before data is passed back via
+        yield(), even if yield_str is not seen.
+
+        Yields (stdout, stderr) output.
+        """
+        read_set = []
+        stdout = None # Return
+        stderr = None # Return
+        proc = self.process
+
+        # subprocess's communicate deals with fixing up newlines
+        # I don't do that here
+        if proc.stdout and (not proc.stdout.closed):
+            read_set.append(proc.stdout)
+            stdout = []
+        if proc.stderr and (not proc.stderr.closed):
+            read_set.append(proc.stderr)
+            stderr = []
+        if not read_set:
+            raise StopIteration
+        # Strange thing - the subprocess module loops over and checks up on read_set.
+        # unless I'm recursing (possible?) I'm seeing that I empty out read_set,
+        # and the next round through the loop doesn't end, instead it continue with
+        # closed file descriptors.
+        while True:
+            if not read_set:
+                # print "read_set is empty, returning"
+                return
+            try:
+                rlist, wlist, xlist = select.select(read_set, [], [])
+            except select.error, e:
+                if e.args[0] == errno.EINTR:
+                    continue
+                raise
+            if proc.stdout in rlist:
+                data = os.read(proc.stdout.fileno(), 1024)
+                if data == "": # empty read, fd is closed at the other end
+                    proc.stdout.close()
+                    read_set.remove(proc.stdout)
+                stdout.append(data)
+                # print stdout
+
+            if proc.stderr in rlist:
+                data = os.read(proc.stderr.fileno(), 1024)
+                if data == "":
+                    proc.stderr.close()
+                    read_set.remove(proc.stderr)
+                stderr.append(data)
+            # yield (universal_newlines("".join(stdout)),
+            #        universal_newlines("".join(stderr)))
+            yield "".join(stdout), "".join(stderr)
+
+            del(stdout[:])
+            del(stderr[:])
         
         
     def wait(self):
@@ -294,20 +476,23 @@ class Command(object):
         # leave shell=False
         self.process = subp.Popen(cmd, shell=False, env=os.environ,
             stdin=stdin, stdout=stdout, stderr=stderr)
-
+        
         # we're running in the background, return self and let us lazily
         # evaluate
         if self.call_args["bg"]: return self
 
-        # run and block
-        self._stdout, self._stderr = self.process.communicate(actual_stdin)
-        rc = self.process.wait()
+        if self.call_args["generate"]:
+            # The caller has to call our wait call, we're not going to stick around that long
+            # print "generating"
+            # The caller wants a stream of input, so must call self.wait() explicitly
+            return self
+        else:
+            # run and block
+            self._stdout, self._stderr = self.process.communicate(actual_stdin)
+            rc = self.process.wait()
 
-        if rc != 0: raise get_rc_exc(rc)(self._command_ran, self.stdout, self.stderr)
-        return self
-
-
-
+            if rc != 0: raise get_rc_exc(rc)(self._command_ran, self.stdout, self.stderr)
+            return self
 
 
 
@@ -341,7 +526,7 @@ class Environment(dict):
         # that's really the only sensible thing to do
         if k == "__all__":
             raise RuntimeError("Cannot import * from the commandline, please \
-see \"Limitations\" here: %s" % __project_url__)
+see \"Limitations\" here: %s" % PROJECT_URL)
 
         # if we end with "_" just go ahead and skip searching
         # our namespace for python stuff.  this was mainly for the
@@ -376,6 +561,13 @@ see \"Limitations\" here: %s" % __project_url__)
         # it must be a command then
         return Command.create(k)
     
+    
+    def b_echo(self, *args, **kwargs):
+        out = Command("echo")(*args, **kwargs)
+        # no point printing if we're redirecting...
+        if out.stdout is not None: print(out)
+        return out
+    
     def b_cd(self, path):
         os.chdir(path)
         
@@ -389,7 +581,7 @@ see \"Limitations\" here: %s" % __project_url__)
 def run_repl(env):
     banner = "\n>> PBS v{version}\n>> https://github.com/amoffat/pbs\n"
     
-    print(banner.format(version=__version__))
+    print(banner.format(version=VERSION))
     while True:
         try: line = raw_input("pbs> ")
         except (ValueError, EOFError): break
@@ -455,12 +647,12 @@ else:
             if frame.f_globals["__name__"] != "__main__":
                 raise RuntimeError("Cannot import * from anywhere other than \
 a stand-alone script.  Do a 'from pbs import program' instead. Please see \
-\"Limitations\" here: %s" % __project_url__)
+\"Limitations\" here: %s" % PROJECT_URL)
 
             warnings.warn("Importing * from pbs is magical and therefore has \
 some limitations.  Please become familiar with them under \"Limitations\" \
 here: %s  To avoid this warning, use a warning filter or import your \
-programs directly with \"from pbs import <program>\"" % __project_url__,
+programs directly with \"from pbs import <program>\"" % PROJECT_URL,
 RuntimeWarning, stacklevel=2)
 
             # we avoid recursion by removing the line that imports us :)

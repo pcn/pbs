@@ -36,10 +36,10 @@ import traceback
 
 
 
-VERSION = "0.71"
-PROJECT_URL = "https://github.com/amoffat/pbs"
-IS_PY3 = sys.version_info[0] == 3
+__version__ = "0.75"
+__project_url__ = "https://github.com/amoffat/pbs"
 
+IS_PY3 = sys.version_info[0] == 3
 if IS_PY3: raw_input = input
 
 
@@ -153,10 +153,12 @@ class Command(object):
         if self.call_args["generate"]:
             raise TypeError("generator requested, can't use stdout'")
         return self._stdout
-        
+
     @property
     def stderr(self):
         if self.call_args["bg"]: self.wait()
+        if self.call_args["generate"]:
+            raise TypeError("generator requested, can't use stderr'")
         return self._stderr
 
 
@@ -193,8 +195,8 @@ class Command(object):
             if STDOUT and STDERR:
                 yield (self._extract_line(self._stdout_buffer, bufsize, sep),
                        self._extract_line(self._stderr_buffer, bufsize, sep))
+                # XXX: Fill-in the end-of-both-fd conditions here
             elif STDOUT:
-                # print "called {0}".format(inspect.getframeinfo(inspect.currentframe())[2])
                 val = self._extract_line(self._stdout_buffer, bufsize, sep)
                 if len(val) > 0:
                     yield val
@@ -204,6 +206,9 @@ class Command(object):
                 val = self._extract_line(self._stderr_buffer, bufsize, sep)
                 if len(val) > 0:
                     yield val
+                if not self._stderr_buffer and not se:
+                    return
+
 
 
     def _extract_line(self, fd_buffer, bufsize, sep):
@@ -232,33 +237,29 @@ class Command(object):
             
         # first case, separator string is in the first string in the buffer
         next_sep = b[0].find(sep)
-        if next_sep > -1:
-            line = trim_car(next_sep)
-        else:
-            # second case, no separator found in the first string.  Search for it
-            # in subsequent strings.  Maybe could encompass the first case
-            holding_pen = list()
-            for hold in b:
-                if hold.find(sep) > -1: 
-                    break
-                else:
-                    holding_pen.append(hold)
+        bullpen = list()
+        for hold in b:
+            if hold.find(sep) > -1: 
+                break
             else:
-                # OH NO document what we want to do here better.  Could be deadlock-inducing?
-                sys.stderr.write("Returning {0} items without having found the separator".format(bufsize))
-                line = "".join(b)
-                del(b[:])
-                # need to fix to clarify whether we're talking bytes or characters
-                if len(line) > bufsize:
-                    b.append(line[bufsize:])
-                    line = line[0:bufsize]
-                return line
-            # Now holding_pen has strings leading up to the string with the separator.
-            if len(holding_pen) > 0: 
-                del(fd_buffer[0:len(holding_pen)])
-            tail = trim_car(hold.find(sep))
-            holding_pen.append(tail)
-            line = "".join(holding_pen)
+                bullpen.append(hold)
+        else:
+            # document what we want to do here better.  I'm worried
+            # about inducing deadlock with >1 fd being juggled
+            line = "".join(b)
+            del(b[:])
+            # need to fix to clarify whether we're talking bytes or characters for python3?
+            if len(line) > bufsize:
+                b.append(line[bufsize:])
+                line = line[0:bufsize]
+            return line
+        # Now bullpen has strings leading up to the string with the separator.
+        if len(bullpen) > 0: 
+            del(fd_buffer[0:len(bullpen)])
+        tail = trim_car(hold.find(sep))
+        bullpen.append(tail)
+        line = "".join(bullpen)
+
         return line
     
 
@@ -482,9 +483,8 @@ class Command(object):
         if self.call_args["bg"]: return self
 
         if self.call_args["generate"]:
-            # The caller has to call our wait call, we're not going to stick around that long
-            # print "generating"
             # The caller wants a stream of input, so must call self.wait() explicitly
+            # after StopIteration is raised on the fd's that want it.
             return self
         else:
             # run and block
@@ -526,7 +526,7 @@ class Environment(dict):
         # that's really the only sensible thing to do
         if k == "__all__":
             raise RuntimeError("Cannot import * from the commandline, please \
-see \"Limitations\" here: %s" % PROJECT_URL)
+see \"Limitations\" here: %s" % __project_url__)
 
         # if we end with "_" just go ahead and skip searching
         # our namespace for python stuff.  this was mainly for the
@@ -581,7 +581,7 @@ see \"Limitations\" here: %s" % PROJECT_URL)
 def run_repl(env):
     banner = "\n>> PBS v{version}\n>> https://github.com/amoffat/pbs\n"
     
-    print(banner.format(version=VERSION))
+    print(banner.format(version=__version__))
     while True:
         try: line = raw_input("pbs> ")
         except (ValueError, EOFError): break
@@ -647,12 +647,12 @@ else:
             if frame.f_globals["__name__"] != "__main__":
                 raise RuntimeError("Cannot import * from anywhere other than \
 a stand-alone script.  Do a 'from pbs import program' instead. Please see \
-\"Limitations\" here: %s" % PROJECT_URL)
+\"Limitations\" here: %s" % __project_url__)
 
             warnings.warn("Importing * from pbs is magical and therefore has \
 some limitations.  Please become familiar with them under \"Limitations\" \
 here: %s  To avoid this warning, use a warning filter or import your \
-programs directly with \"from pbs import <program>\"" % PROJECT_URL,
+programs directly with \"from pbs import <program>\"" % __project_url__,
 RuntimeWarning, stacklevel=2)
 
             # we avoid recursion by removing the line that imports us :)

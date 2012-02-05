@@ -130,6 +130,7 @@ class Command(object):
         self.path = path
         
         self.process = None
+        self._input = None
         self._stdout = None
         self._stderr = None
         self._stdout_buffer = list()
@@ -146,6 +147,9 @@ class Command(object):
         
     def __getattr__(self, p):
         return getattr(str(self), p)
+
+    def set_input(self, var):
+        self._input = var
         
     @property
     def stdout(self):
@@ -163,9 +167,17 @@ class Command(object):
 
 
     def generate_stdout(self, bufsize=1024, sep='\n'):
+        if not self.call_args["generator"]:
+            raise TypeError("generator not requested, can't call generate_stdout()")
         for line in self._generate_stdfds_line(bufsize, sep, STDOUT=True):
             yield line
-        
+
+    def generate_stderr(self, bufsize=1024, sep='\n'):
+        for line in self._generate_stdfds_line(bufsize, sep, STDERR=True):
+            yield line
+        if not self.call_args["generator"]:
+            raise TypeError("generator not requested, can't call generate_stderr()")
+            
     def _generate_stdfds_line(self, bufsize, sep, STDOUT=False, STDERR=False):
         """There are whole families of commands that generate data,
         e.g. vmstat, tcpdump etc. It's silly how difficult it is to
@@ -175,8 +187,10 @@ class Command(object):
         split_char is the character that the stream will be split on.
 
         """
-        gen = self._generate_read_fds()
+        gen         = self._generate_fds()
         source_done = False
+        sout        = None
+        serr        = None
         while True:
             # Check to see if the generator is done, and stop using it
             # if it is.  Continuing to blindly try it can lead to
@@ -184,38 +198,32 @@ class Command(object):
             # works.
             if source_done is False:
                 try:
-                    (so,se) = gen.next()
-                    if so:
-                        self._stdout_buffer.append(so)
-                    if se:
-                        self._stderr_buffer.append(se)
+                    (sout,serr) = gen.next()
+                    if sout:
+                        self._stdout_buffer.append(sout)
+                    if serr:
+                        self._stderr_buffer.append(serr)
                 except StopIteration:
+                    # only raised when both fds are closed
                     source_done = True
 
-            if STDOUT and STDERR:
-                yield (self._extract_line(self._stdout_buffer, bufsize, sep),
-                       self._extract_line(self._stderr_buffer, bufsize, sep))
-                # XXX: Fill-in the end-of-both-fd conditions here
-            elif STDOUT:
+            if STDOUT:
                 val = self._extract_line(self._stdout_buffer, bufsize, sep)
                 if len(val) > 0:
                     yield val
-                if not self._stdout_buffer and not so:
+                if not self._stdout_buffer and not sout:
                     return
             elif STDERR:
                 val = self._extract_line(self._stderr_buffer, bufsize, sep)
                 if len(val) > 0:
                     yield val
-                if not self._stderr_buffer and not se:
+                if not self._stderr_buffer and not serr:
                     return
-
-
 
     def _extract_line(self, fd_buffer, bufsize, sep):
         """Manages the fd_buffer, returning either:
-
         1) a line of data (if sep is encountered), including
-           sep at the end
+           sep at the end.
         2) a buffer of bufsize or less (less if the fd was closed, and
            less data was read but no sep was encountered)
         """
@@ -226,8 +234,8 @@ class Command(object):
         def trim_car(offset):
             retstr = b[0][0:offset+sl]
             b[0]   = b[0][offset+sl:] # shrink the string in the car
-            # If the car is an empty string, get rid of it
             if len(b[0]) == 0:
+                # If the car is an empty string, get rid of it
                 del(b[0])
             return retstr
 
@@ -248,7 +256,7 @@ class Command(object):
             # about inducing deadlock with >1 fd being juggled
             line = "".join(b)
             del(b[:])
-            # need to fix to clarify whether we're talking bytes or characters for python3?
+            # need to clarify whether we're talking bytes or characters for python3
             if len(line) > bufsize:
                 b.append(line[bufsize:])
                 line = line[0:bufsize]
@@ -259,17 +267,13 @@ class Command(object):
         tail = trim_car(hold.find(sep))
         bullpen.append(tail)
         line = "".join(bullpen)
-
         return line
-    
 
-    # XXX: input?
-    def _generate_read_fds(self):
+    def _generate_fds(self):
         """Can't have reading on e.g. stdout stuck because it's
         waiting for stderr to be read from.  So read from stdout and
-        stderr at the same time, and buffer to their respective buffers.
-
-        Using the code from subproceses.py's posix _communicate.
+        stderr at the same time, and buffer to their respective buffers
+        in the caller.
 
         Maybe change this to allow an input generator, but here there
         be dragons.  The current use case is to have a process that
@@ -277,63 +281,85 @@ class Command(object):
         input into the same process creates a big opportunity for
         deadlock, I think.
 
-        THIS CANNOT BE USED WITH THE communicate() METHOD!
-
-        bufsize imposes a max # of (bytes in python 3?  Have to check
-        that out..) that will be read before data is passed back via
-        yield(), even if yield_str is not seen.
-
         Yields (stdout, stderr) output.
-        """
-        read_set = []
-        stdout = None # Return
-        stderr = None # Return
-        proc = self.process
 
-        # subprocess's communicate deals with fixing up newlines
-        # I don't do that here
+        Note the input can't be a generator itself at this point.
+        """
+        read_set     = []
+        write_set    = []
+        stdin        = None
+        stdout       = None # Return
+        stderr       = None # Return
+        proc         = self.process
+        input_offset = 0
+
+        if proc.stdin and (not proc.stdin.closed):
+            # Flush stdio buffer.  This might block, if the user has
+            # been writing to .stdin in an uncontrolled fashion.
+            proc.stdin.flush()
+            if self._input:
+                write_set.append(proc.stdin)
+            else:
+                proc.stdin.close()
         if proc.stdout and (not proc.stdout.closed):
             read_set.append(proc.stdout)
             stdout = []
+        else: print "no stdout? {0}".format(proc.stdout)
         if proc.stderr and (not proc.stderr.closed):
             read_set.append(proc.stderr)
             stderr = []
-        if not read_set:
-            raise StopIteration
-        # Strange thing - the subprocess module loops over and checks up on read_set.
-        # unless I'm recursing (possible?) I'm seeing that I empty out read_set,
-        # and the next round through the loop doesn't end, instead it continue with
-        # closed file descriptors.
+
+        # if not read_set:
+        #     print "stopping iteration from not read_set"
+        #     raise StopIteration
+
+        try: # python 2.7/3.2
+            PIPE_BUF = select.PIPE_BUF
+        except AttributeError: # older versions
+            PIPE_BUF=512
+
+        count = 0
         while True:
-            if not read_set:
-                # print "read_set is empty, returning"
-                return
+            if not read_set and not write_set:
+                print read_set, write_set
+                print "stopping iteration from not read_set and not write_set"
+                raise StopIteration
             try:
-                rlist, wlist, xlist = select.select(read_set, [], [])
+                # .1 second timeout - looping shoudln't be costly, right?
+                rlist, wlist, xlist = select.select(read_set, write_set, [])
             except select.error, e:
                 if e.args[0] == errno.EINTR:
                     continue
                 raise
+
+            if proc.stdin in wlist:
+                # When select has indicated that the file is writable,
+                # we can write up to PIPE_BUF bytes without risk of
+                # blocking.  
+                chunk = self._input[input_offset : input_offset + PIPE_BUF]
+                # TODO: handle input pipes and generators?
+                bytes_written = os.write(proc.stdin.fileno(), chunk)
+                input_offset += bytes_written
+                if input_offset >= len(self._input):
+                    proc.stdin.close()
+                    write_set.remove(proc.stdin)
+                
             if proc.stdout in rlist:
                 data = os.read(proc.stdout.fileno(), 1024)
-                if data == "": # empty read, fd is closed at the other end
+                if data == "": # empty read, fd is empty, close
                     proc.stdout.close()
                     read_set.remove(proc.stdout)
                 stdout.append(data)
-                # print stdout
-
             if proc.stderr in rlist:
                 data = os.read(proc.stderr.fileno(), 1024)
                 if data == "":
                     proc.stderr.close()
                     read_set.remove(proc.stderr)
                 stderr.append(data)
-            # yield (universal_newlines("".join(stdout)),
-            #        universal_newlines("".join(stderr)))
-            yield "".join(stdout), "".join(stderr)
-
-            del(stdout[:])
-            del(stderr[:])
+            if rlist:
+                yield "".join(stdout), "".join(stderr)
+                del(stdout[:])
+                del(stderr[:])
         
         
     def wait(self):
@@ -362,7 +388,8 @@ class Command(object):
         
     def __unicode__(self):
         if self.process: 
-            if self.stdout: return self.stdout.decode("utf-8") # byte string
+            if not self.call_args["generator"] and self.stdout:
+                return self.stdout.decode("utf-8") # byte string
             else: return ""
         else: return self.path
 
@@ -477,7 +504,6 @@ class Command(object):
         # leave shell=False
         self.process = subp.Popen(cmd, shell=False, env=os.environ,
             stdin=stdin, stdout=stdout, stderr=stderr)
-        
         # we're running in the background, return self and let us lazily
         # evaluate
         if self.call_args["bg"]: return self
